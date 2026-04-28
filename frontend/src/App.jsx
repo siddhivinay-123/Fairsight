@@ -13,7 +13,10 @@ import { AuthProvider, useAuth } from './contexts/AuthContext.jsx'
 import AuthScreen from './components/AuthScreen.jsx'
 import OnboardingTour from './components/OnboardingTour.jsx'
 import CareerCoach from './components/CareerCoach.jsx'
-
+import UploadCandidates from './components/UploadCandidates.jsx'
+import BiasSimulator from './components/BiasSimulator.jsx'
+import ResumeTester from './components/ResumeTester.jsx'
+import DriftDetector from './components/DriftDetector.jsx'
 // ── Custom Tooltip ────────────────────────────────────────────────────────────
 const ChartTooltip = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null
@@ -34,7 +37,11 @@ function Sidebar({ activeTab, setTab }) {
     { id: 'dashboard', icon: '◈', label: 'Dashboard' },
     { id: 'live',      icon: '◉', label: 'Live Feed' },
     { id: 'audit',     icon: '◎', label: 'Audit Tool' },
-    { id: 'career',    icon: '🚀', label: 'Career Coach', badge: 'NEW' },
+    { id: 'simulator', icon: '🎛', label: 'Bias Simulator', badge: 'NEW' },
+    { id: 'tester',    icon: '⚖', label: 'Resume A/B Tester', badge: 'NEW' },
+    { id: 'drift',     icon: '📉', label: 'Drift Detector', badge: 'ALERT' },
+    { id: 'career',    icon: '🚀', label: 'Career Coach', badge: 'AI' },
+    { id: 'upload',    icon: '📂', label: 'Upload Candidates', badge: 'NEW' },
     { id: 'analytics', icon: '◇', label: 'Analytics' },
     { id: 'demo',      icon: '◆', label: 'Demo Mode' },
   ]
@@ -781,7 +788,11 @@ function MainLayout() {
                 {activeTab === 'dashboard' && <DashboardHome liveStats={liveStats} events={events} statsData={statsData} />}
                 {activeTab === 'live' && <LiveFeedPanel events={events} connected={connected} />}
                 {activeTab === 'audit' && <AuditTool />}
+                {activeTab === 'simulator' && <BiasSimulator />}
+                {activeTab === 'tester' && <ResumeTester />}
+                {activeTab === 'drift' && <DriftDetector />}
                 {activeTab === 'career' && <CareerCoach />}
+                {activeTab === 'upload' && <UploadCandidates />}
                 {activeTab === 'analytics' && <Analytics events={events} />}
                 {activeTab === 'demo' && <DemoMode />}
               </motion.div>

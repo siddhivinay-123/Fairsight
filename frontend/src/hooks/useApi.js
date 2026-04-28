@@ -15,11 +15,9 @@ export function useApi() {
     })
     if (!res.ok) throw new Error('Audit failed')
     const json = await res.json()
-    try {
-      await addDoc(collection(db, 'audits'), { ...json, createdAt: new Date() })
-    } catch (e) {
-      console.error('Firebase DB Error:', e)
-    }
+    // Save to Firebase (non-blocking)
+    addDoc(collection(db, 'audits'), { ...json, createdAt: new Date() })
+      .catch(e => console.error('Firebase DB Error:', e))
     return json
   }, [])
 
@@ -42,7 +40,49 @@ export function useApi() {
     return res.json()
   }, [])
 
-  return { audit, auditBatch, getStats, simulate }
+  const uploadCandidates = useCallback(async (file) => {
+    const formData = new FormData()
+    formData.append('file', file)
+    const res = await fetch(`${API_BASE}/upload-candidates`, {
+      method: 'POST',
+      body: formData,
+    })
+    if (!res.ok) throw new Error('Upload failed')
+    return res.json()
+  }, [])
+
+  const getCandidates = useCallback(async (limit = 100, offset = 0) => {
+    const res = await fetch(`${API_BASE}/candidates?limit=${limit}&offset=${offset}`)
+    if (!res.ok) throw new Error('Failed to fetch candidates')
+    return res.json()
+  }, [])
+
+  const clearCandidates = useCallback(async () => {
+    const res = await fetch(`${API_BASE}/candidates`, { method: 'DELETE' })
+    return res.json()
+  }, [])
+
+  const sendInvitation = useCallback(async (payload) => {
+    const res = await fetch(`${API_BASE}/send-invitation`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!res.ok) throw new Error('Failed to send invitation')
+    return res.json()
+  }, [])
+
+  const generateInvitation = useCallback(async (payload) => {
+    const res = await fetch(`${API_BASE}/generate-invitation`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    if (!res.ok) throw new Error('Failed to generate invitation')
+    return res.json()
+  }, [])
+
+  return { audit, auditBatch, getStats, simulate, uploadCandidates, getCandidates, clearCandidates, sendInvitation, generateInvitation }
 }
 
 // ── WebSocket Live Feed ──────────────────────────────────────────────────────

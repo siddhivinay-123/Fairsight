@@ -1,17 +1,22 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 import asyncio
 import json
 import random
 import time
+import io
+import csv
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import numpy as np
 from pydantic import BaseModel
 import google.generativeai as genai
 import os
 from dotenv import load_dotenv
+import PyPDF2
+from docx import Document
 
 # Load env variables
 load_dotenv()
@@ -19,18 +24,61 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-1.5-flash-latest')
+    model = genai.GenerativeModel('gemini-flash-latest')
 else:
     model = None
+
+# ─── Text Extraction ──────────────────────────────────────────────────────────
+def extract_text_from_file(file: UploadFile) -> str:
+    """Extract text from PDF or DOCX file."""
+    filename = file.filename.lower()
+    content = file.file.read()
+    
+    if filename.endswith('.pdf'):
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(content))
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+        return text.strip()
+    elif filename.endswith('.docx'):
+        doc = Document(io.BytesIO(content))
+        text = ""
+        for para in doc.paragraphs:
+            text += para.text + "\n"
+        return text.strip()
+    else:
+        # Assume plain text
+        return content.decode('utf-8').strip()
+
+# ─── In-Memory Candidate Database ─────────────────────────────────────────────
+candidates_db: List[Dict[str, Any]] = []
 
 # ─── Models ───────────────────────────────────────────────────────────────────
 class AuditRequest(BaseModel):
     features: dict
     prediction: float
     domain: str = "hiring"  # hiring | finance | healthcare
+    mode: str = "fair"     # fair | performance
 
 class BatchAuditRequest(BaseModel):
     records: List[AuditRequest]
+
+class CareerCoachRequest(BaseModel):
+    resume_text: str
+    target_path: str   # swe | ml | ds | pm | cyber | devops
+    target_level: str  # junior | mid | staff
+
+class InvitationRequest(BaseModel):
+    candidateId: str
+    message: str
+    interviewDate: Optional[str] = None
+    interviewType: Optional[str] = None
+    meetingLink: Optional[str] = None
+
+class GenerateInvitationRequest(BaseModel):
+    candidateName: str
+    companyName: str = "FairSight"
+    tone: str = "Formal"
 
 # ─── App Setup ────────────────────────────────────────────────────────────────
 app = FastAPI(title="FairSight API", version="1.0.0")
@@ -65,7 +113,8 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 # ─── Fairness Engine ──────────────────────────────────────────────────────────
-async def compute_fairness_metrics(features: dict, prediction: float, domain: str):
+async def compute_fairness_metrics(features: dict, prediction: float, domain: str, mode: str = "fair"):
+    """Compute realistic fairness metrics based on features."""
     """Compute realistic fairness metrics based on features."""
     
     # Detect sensitive attributes
@@ -118,6 +167,14 @@ async def compute_fairness_metrics(features: dict, prediction: float, domain: st
     # Overall fairness score 0-100
     fairness_score = max(0, min(100, 100 * (1 - total_bias * 1.2)))
     
+    # Dual Mode Adjustments
+    if mode == "performance":
+        # Simulate a drop in fairness when prioritizing performance
+        fairness_score = max(5, fairness_score * 0.75) 
+        disparate_impact *= 0.8
+        individual_fairness *= 0.85
+        total_bias *= 1.4
+    
     # SHAP-like feature importances
     feature_impacts = {}
     feature_names = list(features.keys())
@@ -165,9 +222,10 @@ async def compute_fairness_metrics(features: dict, prediction: float, domain: st
         "original_prediction": round(prediction, 4),
         "corrected_prediction": round(corrected_prediction, 4),
         "fairness_improvement": round((corrected_prediction - prediction) * 100, 1),
-        "latency_ms": round(random.uniform(45, 180), 1),
+        "latency_ms": round(random.uniform(20, 60), 1) if mode == "performance" else round(random.uniform(45, 180), 1),
         "timestamp": datetime.utcnow().isoformat(),
         "domain": domain,
+        "mode": mode,
         "recommendation": recommendation,
         "career_guidance": career_guidance,
     }
@@ -186,7 +244,11 @@ async def _get_recommendation(flags, bias_level, domain, features):
     Return as a JSON list of strings.
     """
     try:
-        response = await asyncio.to_thread(model.generate_content, prompt)
+        # Add a strict timeout to prevent hanging
+        response = await asyncio.wait_for(
+            asyncio.to_thread(model.generate_content, prompt),
+            timeout=8.0
+        )
         text = response.text
         # Simple extraction if not perfect JSON
         if "[" in text and "]" in text:
@@ -194,6 +256,9 @@ async def _get_recommendation(flags, bias_level, domain, features):
             end = text.rfind("]") + 1
             return json.loads(text[start:end])
         return [text.strip()]
+    except asyncio.TimeoutError:
+        print("Gemini Timeout (Rec)")
+        return _get_fallback_recommendation(flags, bias_level, domain)
     except Exception as e:
         print(f"Gemini Error (Rec): {e}")
         return _get_fallback_recommendation(flags, bias_level, domain)
@@ -221,22 +286,46 @@ async def _get_career_guidance(features, domain):
     if not model:
         return _get_fallback_guidance(features)
 
+    resume_text = str(features.get("resume_text", ""))
+    skills = str(features.get("skills", ""))
+    experience = features.get("experience_years", 0)
+    education = str(features.get("education", ""))
+    name = str(features.get("name", "the candidate"))
+
     prompt = f"""
-    You are a career coach. A candidate is being evaluated by an AI with these features: {features}
+    You are an expert career coach analyzing a specific resume for a hiring opportunity.
     
-    Provide 4-5 highly specific, actionable pieces of advice for this candidate to improve their chances and handle the interview.
-    Focus on skills, resume improvements, and interview strategy.
-    Keep each advice point concise.
-    Return as a JSON list of strings.
+    Candidate Profile:
+    - Name: {name}
+    - Experience: {experience} years
+    - Education: {education}
+    - Skills: {skills}
+    - Resume Text: {resume_text}
+    
+    Based SPECIFICALLY on this candidate's actual resume content, skills, and experience level:
+    1. Identify the strongest points in this specific resume
+    2. Point out exact weaknesses or gaps visible in this resume
+    3. Give 4-5 highly specific, actionable pieces of advice tailored to THIS candidate
+    4. Suggest specific interview preparation steps based on their background
+    
+    Do NOT give generic advice. Reference specific details from their resume.
+    Return as a JSON list of strings (each string is one piece of advice).
     """
     try:
-        response = await asyncio.to_thread(model.generate_content, prompt)
+        # Add a strict timeout to prevent hanging
+        response = await asyncio.wait_for(
+            asyncio.to_thread(model.generate_content, prompt),
+            timeout=10.0
+        )
         text = response.text
         if "[" in text and "]" in text:
             start = text.find("[")
             end = text.rfind("]") + 1
             return json.loads(text[start:end])
         return [text.strip()]
+    except asyncio.TimeoutError:
+        print("Gemini Timeout (Guidance)")
+        return _get_fallback_guidance(features)
     except Exception as e:
         print(f"Gemini Error (Guidance): {e}")
         return _get_fallback_guidance(features)
@@ -266,8 +355,121 @@ def _get_fallback_guidance(features):
         
     return guidance
 
+# ─── Career Coach API ─────────────────────────────────────────────────────────
+async def _analyze_resume_with_ai(resume_text: str, target_path: str, target_level: str):
+    """Full AI-powered resume analysis using Gemini."""
+    
+    CAREER_PATHS = {
+        "swe": {"name": "Software Engineer", "ats": ["React", "Node.js", "Docker", "Unit Testing", "CI/CD", "TypeScript", "System Design", "Agile"], "skills": {"core": ["JavaScript", "Python", "SQL"], "nice": ["AWS", "Kubernetes", "GraphQL"]}},
+        "ml":  {"name": "ML/AI Engineer", "ats": ["PyTorch", "TensorFlow", "Scikit-learn", "Model Deployment", "Neural Networks", "NLP", "Feature Engineering", "Pandas"], "skills": {"core": ["Python", "Linear Algebra", "Calculus"], "nice": ["Cloud ML", "MLOps", "Fine-tuning"]}},
+        "ds":  {"name": "Data Scientist", "ats": ["Statistics", "R", "Tableau", "PowerBI", "Hypothesis Testing", "Data Mining", "Storytelling", "A/B Testing"], "skills": {"core": ["Python", "SQL", "Stats"], "nice": ["Big Data", "AutoML", "Excel Mastery"]}},
+        "pm":  {"name": "Product Manager", "ats": ["Roadmapping", "Backlog Grooming", "Stakeholder Mgmt", "KPIs", "User Research", "Agile", "Scrum", "Data-Driven"], "skills": {"core": ["Communication", "Market Analysis", "Strategic Planning"], "nice": ["UX Design Basics", "Growth Hacking", "MBA"]}},
+        "cyber": {"name": "Cybersecurity", "ats": ["Pentesting", "Network Security", "Compliance", "SOC", "Firewalls", "Identity Mgmt", "Cryptography", "Incident Response"], "skills": {"core": ["Networking", "Linux", "OSINT"], "nice": ["CEH", "CISSP", "Cloud Security"]}},
+        "devops": {"name": "DevOps Engineer", "ats": ["Terraform", "Ansible", "Kubernetes", "Jenkins", "AWS/Azure", "Monitoring", "Infrastructure as Code", "Python"], "skills": {"core": ["Linux", "Scripting", "Cloud Architecture"], "nice": ["Site Reliability", "Security", "Prometheus"]}},
+    }
+
+    path_info = CAREER_PATHS.get(target_path, CAREER_PATHS["swe"])
+    lower_resume = resume_text.lower()
+
+    # ATS Score (deterministic based on resume content)
+    matched_ats = [term for term in path_info["ats"] if term.lower() in lower_resume]
+    ats_score = round((len(matched_ats) / len(path_info["ats"])) * 100)
+
+    # Skills Gap
+    missing_core = [s for s in path_info["skills"]["core"] if s.lower() not in lower_resume]
+
+    # Bias phrases
+    BIAS_PHRASES = [
+        {"phrase": "maternity leave", "category": "Family/Gender", "severity": "high", "fix": "Remove mention of specific leave types; focus purely on skills."},
+        {"phrase": "stay-at-home parent", "category": "Family/Gender", "severity": "high", "fix": "List as 'Professional Sabbatical' or omit if not relevant to role."},
+        {"phrase": "recent graduate", "category": "Age", "severity": "medium", "fix": "Use 'Junior Professional' or 'Entry-Level' to avoid age-based filtering."},
+        {"phrase": "digital native", "category": "Age", "severity": "medium", "fix": "List specific technical proficiencies instead."},
+        {"phrase": "cultural fit", "category": "Subjective Bias", "severity": "medium", "fix": "Focus on 'Cultural Contribution' or specific value alignment."},
+        {"phrase": "native speaker", "category": "National Origin", "severity": "high", "fix": "Use 'Proficient in [Language]' or 'Fluent' instead."},
+        {"phrase": "energetic", "category": "Age", "severity": "low", "fix": "Use 'Results-driven' or 'Highly productive'."},
+        {"phrase": "church", "category": "Religion", "severity": "high", "fix": "Use 'Non-profit Organization' or 'Community Group' if necessary."},
+        {"phrase": "married", "category": "Marital Status", "severity": "high", "fix": "Remove marital status entirely; it is a legal liability."},
+        {"phrase": "she/her", "category": "Gender", "severity": "medium", "fix": "Consider a gender-neutral resume if you suspect bias in initial screening."},
+        {"phrase": "he/him", "category": "Gender", "severity": "medium", "fix": "Consider a gender-neutral resume if you suspect bias in initial screening."},
+        {"phrase": "gap year", "category": "Socio-economic", "severity": "low", "fix": "Provide brief professional context for the gap."},
+    ]
+    found_bias = [b for b in BIAS_PHRASES if b["phrase"].lower() in lower_resume]
+
+    # AI-powered personalized coaching tips
+    if model:
+        prompt = f"""
+        You are an expert career coach and resume specialist.
+        
+        Candidate is targeting: {path_info['name']} role at {target_level} level.
+        
+        Their resume content:
+        ---
+        {resume_text}
+        ---
+        
+        ATS Keywords they MATCHED for {path_info['name']}: {matched_ats}
+        ATS Keywords they MISSED: {[t for t in path_info['ats'] if t.lower() not in lower_resume]}
+        Core skills MISSING from resume: {missing_core}
+        Bias phrases FOUND in resume: {[b['phrase'] for b in found_bias]}
+        
+        Based SPECIFICALLY on this actual resume content:
+        1. Give 5-6 highly personalized, actionable coaching tips
+        2. Reference specific things you see (or don't see) in their resume
+        3. Include tips on what to add, remove, or improve
+        4. Tailor advice to the {target_level} level for {path_info['name']}
+        
+        Do NOT give generic advice. Be specific to THIS resume.
+        Return as a JSON list of strings.
+        """
+        try:
+            # Add a strict timeout to prevent hanging
+            response = await asyncio.wait_for(
+                asyncio.to_thread(model.generate_content, prompt),
+                timeout=12.0
+            )
+            text = response.text
+            if "[" in text and "]" in text:
+                start = text.find("[")
+                end = text.rfind("]") + 1
+                ai_tips = json.loads(text[start:end])
+            else:
+                ai_tips = [text.strip()]
+        except asyncio.TimeoutError:
+            print("Gemini Career Coach Timeout")
+            ai_tips = _get_generic_coaching_tips(target_path, target_level, missing_core, matched_ats)
+        except Exception as e:
+            print(f"Gemini Career Coach Error: {e}")
+            ai_tips = _get_generic_coaching_tips(target_path, target_level, missing_core, matched_ats)
+    else:
+        ai_tips = _get_generic_coaching_tips(target_path, target_level, missing_core, matched_ats)
+
+    return {
+        "ats_score": ats_score,
+        "matched_ats": matched_ats,
+        "missing_core": missing_core,
+        "bias_flags": found_bias,
+        "ai_tips": ai_tips,
+        "path_info": path_info,
+        "target_path": target_path,
+        "target_level": target_level,
+    }
+
+def _get_generic_coaching_tips(target_path, target_level, missing_core, matched_ats):
+    tips = []
+    if missing_core:
+        tips.append(f"Critical gap: Add {', '.join(missing_core)} to your skills section immediately — these are core requirements.")
+    if len(matched_ats) < 3:
+        tips.append("Your resume matches very few ATS keywords. Rewrite bullet points to include role-specific terminology.")
+    if target_level == "junior":
+        tips.append("Emphasize personal projects, GitHub repositories, and academic achievements to compensate for limited experience.")
+    elif target_level == "staff":
+        tips.append("Quantify your leadership impact: team sizes managed, revenue influenced, systems scaled.")
+    tips.append("Use the STAR method (Situation, Task, Action, Result) for every bullet point to demonstrate impact.")
+    tips.append("Add a dedicated 'Skills' section with exact technology keywords matching the job description.")
+    return tips
+
 # ─── Routes ───────────────────────────────────────────────────────────────────
-@app.get("/")
+@app.get("/api/status")
 def root():
     return {"name": "FairSight API", "version": "1.0.0", "status": "operational"}
 
@@ -277,9 +479,15 @@ def health():
 
 @app.post("/audit")
 async def audit_decision(req: AuditRequest):
-    result = await compute_fairness_metrics(req.features, req.prediction, req.domain)
-    await manager.broadcast({"type": "audit_result", "data": result})
-    return result
+    print(f"DEBUG: Received audit request for domain: {req.domain} (Mode: {req.mode})")
+    try:
+        result = await compute_fairness_metrics(req.features, req.prediction, req.domain, req.mode)
+        print(f"DEBUG: Computation complete for {req.domain}")
+        await manager.broadcast({"type": "audit_result", "data": result})
+        return result
+    except Exception as e:
+        print(f"DEBUG: Audit Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/audit/batch")
 async def audit_batch(req: BatchAuditRequest):
@@ -300,10 +508,146 @@ async def audit_batch(req: BatchAuditRequest):
         "results": results,
     }
 
+# ─── Career Coach Endpoint ────────────────────────────────────────────────────
+@app.post("/career-coach/analyze")
+async def career_coach_analyze(req: CareerCoachRequest):
+    """AI-powered resume analysis that returns personalized coaching."""
+    if not req.resume_text or len(req.resume_text.strip()) < 10:
+        raise HTTPException(status_code=400, detail="Resume text is too short.")
+    result = await _analyze_resume_with_ai(req.resume_text, req.target_path, req.target_level)
+    return result
+
+@app.post("/career-coach/upload-resume")
+async def upload_resume_and_analyze(
+    file: UploadFile = File(...),
+    target_path: str = Form(...),
+    target_level: str = Form(...)
+):
+    """Upload resume file (PDF/DOCX/TXT), extract text, and analyze with AI."""
+    try:
+        resume_text = extract_text_from_file(file)
+        if len(resume_text.strip()) < 10:
+            raise HTTPException(status_code=400, detail="Resume text is too short or could not be extracted.")
+        
+        result = await _analyze_resume_with_ai(resume_text, target_path, target_level)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error processing file: {str(e)}")
+
+# ─── Upload Candidates ────────────────────────────────────────────────────────
+@app.post("/upload-candidates")
+async def upload_candidates(file: UploadFile = File(...)):
+    """
+    Accept CSV or JSON file, parse it, and store candidates in memory.
+    Returns the list of uploaded candidates.
+    """
+    filename = file.filename.lower()
+    content = await file.read()
+
+    new_candidates = []
+
+    if filename.endswith(".json"):
+        # Parse JSON
+        try:
+            data = json.loads(content.decode("utf-8"))
+            if isinstance(data, list):
+                new_candidates = data
+            elif isinstance(data, dict):
+                # Maybe wrapped: { "candidates": [...] }
+                new_candidates = data.get("candidates", [data])
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {str(e)}")
+
+    elif filename.endswith(".csv"):
+        # Parse CSV
+        try:
+            text = content.decode("utf-8")
+            reader = csv.DictReader(io.StringIO(text))
+            new_candidates = [dict(row) for row in reader]
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Invalid CSV: {str(e)}")
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file type. Please upload a .csv or .json file."
+        )
+
+    if not new_candidates:
+        raise HTTPException(status_code=400, detail="No candidate records found in file.")
+
+    # Stamp each with an ID and upload timestamp
+    for i, c in enumerate(new_candidates):
+        c["_id"] = f"cand_{int(time.time())}_{i}"
+        c["_uploaded_at"] = datetime.utcnow().isoformat()
+
+    candidates_db.extend(new_candidates)
+
+    return {
+        "success": True,
+        "uploaded_count": len(new_candidates),
+        "total_in_db": len(candidates_db),
+        "candidates": new_candidates,
+        "message": f"Successfully uploaded {len(new_candidates)} candidate(s).",
+    }
+
+@app.get("/candidates")
+async def get_candidates(limit: int = 100, offset: int = 0):
+    """Retrieve all uploaded candidates with pagination."""
+    sliced = candidates_db[offset: offset + limit]
+    return {
+        "total": len(candidates_db),
+        "limit": limit,
+        "offset": offset,
+        "candidates": sliced,
+    }
+
+@app.delete("/candidates")
+async def clear_candidates():
+    """Clear all candidates from the in-memory database."""
+    candidates_db.clear()
+    return {"success": True, "message": "All candidates cleared."}
+
+@app.post("/send-invitation")
+async def send_invitation(req: InvitationRequest):
+    # Find candidate
+    candidate = next((c for c in candidates_db if c.get("_id") == req.candidateId), None)
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    
+    # Mock Email sending logic
+    print(f"--- EMAIL SENT TO {candidate.get('name', 'Candidate')} ---")
+    print(f"Subject: Interview Invitation")
+    print(f"Message:\n{req.message}")
+    print(f"Date: {req.interviewDate}, Type: {req.interviewType}, Link: {req.meetingLink}")
+    print(f"--------------------------------------------------")
+    
+    # Update status
+    candidate["invitationStatus"] = "Sent ✅"
+    candidate["interviewDate"] = req.interviewDate
+    candidate["meetingLink"] = req.meetingLink
+    
+    return {"success": True, "message": "Invitation sent successfully"}
+
+@app.post("/generate-invitation")
+async def generate_invitation(req: GenerateInvitationRequest):
+    default_msg = f"Hello {req.candidateName},\n\nCongratulations! You have been shortlisted for the next round at {req.companyName}.\nWe would like to invite you for an interview."
+    if not model:
+        return {"message": default_msg}
+        
+    prompt = f"Write a {req.tone.lower()} interview invitation email for a candidate named {req.candidateName} at {req.companyName}. Do not include subject line, just the body. Keep it short."
+    try:
+        response = await asyncio.wait_for(
+            asyncio.to_thread(model.generate_content, prompt),
+            timeout=8.0
+        )
+        return {"message": response.text.strip()}
+    except:
+        return {"message": default_msg}
+
+# ─── Demo & Stats ─────────────────────────────────────────────────────────────
 @app.get("/demo/simulate")
 async def simulate_stream():
     """Simulate a stream of decisions for demo purposes."""
-    domains = ["hiring", "finance", "healthcare"]
     hiring_features = [
         {"name": "Alex Johnson", "experience_years": 5, "education": "State University",
          "resume_text": "women's leadership program alumni", "age": 32, "skills": "python, ml"},
@@ -345,27 +689,37 @@ def get_stats():
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
     try:
-        # Send initial heartbeat
         await websocket.send_json({"type": "connected", "message": "FairSight live feed active"})
         while True:
-            # Auto-broadcast simulated decisions every few seconds
-            await asyncio.sleep(3)
-            domains = ["hiring", "finance"]
-            domain = random.choice(domains)
-            features = {
-                "age": random.randint(22, 60),
-                "experience_years": random.randint(1, 20),
-                "education": random.choice(["Harvard", "State Univ", "Community College", "MIT", "Online Bootcamp"]),
-                "resume_text": random.choice([
-                    "strong technical background in ml",
-                    "women in tech award winner 2023",
-                    "maternity leave 2021-2022 gap",
-                    "10 years senior engineer",
-                    "first generation college graduate",
-                ]),
-            }
-            pred = random.uniform(0.2, 0.95)
-            result = await compute_fairness_metrics(features, pred, domain)
-            await websocket.send_json({"type": "live_audit", "data": result})
+            # Just keep the connection alive and wait for broadcasts
+            data = await websocket.receive_text()
+            # Optional: handle incoming messages if needed
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+    except Exception as e:
+        print(f"WebSocket Error: {e}")
+        manager.disconnect(websocket)
+
+# ─── Serve Frontend ───────────────────────────────────────────────────────────
+frontend_dist = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "dist"))
+assets_dir = os.path.join(frontend_dist, "assets")
+
+if os.path.exists(assets_dir):
+    app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+
+@app.get("/{full_path:path}")
+async def serve_frontend(full_path: str):
+    # Ignore specific API routes or WebSockets
+    if full_path.startswith("api/") or full_path == "ws":
+        raise HTTPException(status_code=404, detail="Route not found")
+        
+    index_path = os.path.join(frontend_dist, "index.html")
+    file_path = os.path.join(frontend_dist, full_path)
+    
+    if os.path.exists(file_path) and os.path.isfile(file_path):
+        return FileResponse(file_path)
+    
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+        
+    return {"message": "Frontend not built. Please run 'npm run build' in the frontend directory."}
